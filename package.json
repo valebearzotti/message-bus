@@ -1,5 +1,5 @@
 {
-  "name": "message-bus",
+  "name": "@valts/message-bus",
   "version": "1.0.0",
   "description": "A framework-agnostic, type-safe implementation of a message bus for event-driven architecture",
   "main": "dist/index.js",
