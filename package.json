@@ -9,7 +9,6 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "jest",
     "lint": "eslint src --ext .ts",
     "prepublishOnly": "npm run build"
   },
@@ -20,16 +19,21 @@
     "events",
     "typescript"
   ],
-  "author": "",
+  "author": "Valentina Bearzotti",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/valebearzotti/message-bus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/valebearzotti/message-bus/issues"
+  },
+  "homepage": "https://github.com/valebearzotti/message-bus",
   "devDependencies": {
-    "@types/jest": "^29.5.14",
     "@types/node": "^22.13.8",
     "@typescript-eslint/eslint-plugin": "^8.25.0",
     "@typescript-eslint/parser": "^8.25.0",
     "eslint": "^9.21.0",
-    "jest": "^29.7.0",
-    "ts-jest": "^29.2.6",
     "typescript": "^5.8.0"
   }
 }
