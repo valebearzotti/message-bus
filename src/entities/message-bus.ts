@@ -1,18 +1,20 @@
 import { IMessageBus, Message, MessageHandler } from "../models/message";
-import { ProcessorOptions, QueueOptions, QueuedEvent, QueueStatus } from "../models/queue";
+import { QueueOptions, QueueProcessorOptions, QueueStatus, QueuedEvent } from "../models/queue";
 import { Subscription } from "../models/subscription";
 import { AvailableTopic, TopicMap } from "../models/topic";
 import { generateMessageId } from "../utils/id";
+import { EventQueue } from "./event-queue";
 import { EventRegistry } from "./registry";
-import { QueueProcessor } from "./queue-processor";
 
 export class MessageBus<TMap extends TopicMap> implements IMessageBus<TMap> {
   private registry: EventRegistry;
-  private queueProcessor: QueueProcessor<TMap>;
+  private queue: EventQueue<TMap>;
+  private queueProcessorInterval: NodeJS.Timeout | null = null;
+  private isProcessing: boolean = false;
 
   constructor() {
     this.registry = new EventRegistry();
-    this.queueProcessor = new QueueProcessor<TMap>(this.registry);
+    this.queue = new EventQueue<TMap>();
   }
 
   /**
@@ -46,58 +48,111 @@ export class MessageBus<TMap extends TopicMap> implements IMessageBus<TMap> {
   }
 
   /**
-   * Queue an event for later processing
+   * Add an event to the queue for later processing
    */
   queueEvent<Topic extends AvailableTopic<TMap>>(
     topic: Topic,
     payload: TMap[Topic],
     options?: QueueOptions
   ): QueuedEvent<TMap[Topic]> {
-    const message: Message<TMap[Topic]> & { topic: string } = {
-      id: generateMessageId(topic),
-      payload,
-      timestamp: Date.now(),
-      topic: topic as string
-    };
-    
-    return this.queueProcessor.queueEvent(topic as string, message);
+    return this.queue.enqueue(topic, payload, options);
   }
 
   /**
-   * Start processing queued events
-   */
-  startQueueProcessor(options?: ProcessorOptions): void {
-    if (options) {
-      // Create a new processor with the specified options
-      this.queueProcessor = new QueueProcessor<TMap>(this.registry, options);
-    }
-    
-    this.queueProcessor.start();
-  }
-
-  /**
-   * Stop processing queued events
-   */
-  stopQueueProcessor(): void {
-    this.queueProcessor.stop();
-  }
-
-  /**
-   * Process all queued events immediately
+   * Process all queued events that are ready to be processed
    */
   async processQueue(): Promise<void> {
-    await this.queueProcessor.processAll();
+    if (this.isProcessing) {
+      return;
+    }
+
+    this.isProcessing = true;
+    this.queue.setProcessing(true);
+
+    try {
+      let event = this.queue.dequeue();
+      
+      while (event) {
+        const startTime = Date.now();
+        let failed = false;
+        
+        try {
+          // Safely cast the types for dispatching
+          const topic = event.topic as keyof TMap & string;
+          const payload = event.message.payload as any as TMap[typeof topic];
+          
+          await this.event(topic, payload);
+        } catch (error) {
+          failed = true;
+          
+          // Handle retry logic if needed
+          if (event.retryCount < event.maxRetries) {
+            // Safely cast for re-queuing
+            const topic = event.topic as keyof TMap & string;
+            const payload = event.message.payload as any as TMap[typeof topic];
+            
+            this.queue.enqueue(
+              topic, 
+              payload, 
+              { 
+                id: event.id,
+                priority: event.priority,
+                delay: 1000 * Math.pow(2, event.retryCount), // Exponential backoff
+                maxRetries: event.maxRetries
+              }
+            );
+          }
+        }
+        
+        // Record processing statistics
+        const processingTime = Date.now() - startTime;
+        this.queue.recordProcessed(processingTime, failed);
+        
+        // Get next event
+        event = this.queue.dequeue();
+      }
+    } finally {
+      this.isProcessing = false;
+      this.queue.setProcessing(false);
+    }
   }
 
   /**
-   * Get current queue status
+   * Start automatic processing of the queue
+   */
+  startQueueProcessor(options: QueueProcessorOptions = {}): void {
+    if (this.queueProcessorInterval) {
+      this.stopQueueProcessor();
+    }
+
+    const interval = options.processInterval || 100; // Default 100ms
+    
+    this.queueProcessorInterval = setInterval(() => {
+      if (this.queue.hasReadyEvents() && !this.isProcessing) {
+        this.processQueue();
+      }
+    }, interval);
+  }
+
+  /**
+   * Stop automatic processing of the queue
+   */
+  stopQueueProcessor(): void {
+    if (this.queueProcessorInterval) {
+      clearInterval(this.queueProcessorInterval);
+      this.queueProcessorInterval = null;
+    }
+  }
+
+  /**
+   * Get current status of the event queue
    */
   getQueueStatus(): QueueStatus {
-    return this.queueProcessor.getStatus();
+    return this.queue.getStatus();
   }
 
   /**
-   * Subscribe to events of a specific topic
+   * Subscribe to a topic
    */
   subscribe<Topic extends AvailableTopic<TMap>>(
     topic: Topic,

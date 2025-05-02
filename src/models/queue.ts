@@ -1,135 +1,110 @@
 import { Message } from "./message";
+import { AvailableTopic, TopicMap } from "./topic";
 
 /**
- * Event priority levels
+ * Priority levels for queued events
  */
-export type EventPriority = "high" | "normal" | "low";
+export enum QueuePriority {
+  LOW = 0,
+  NORMAL = 1,
+  HIGH = 2,
+  CRITICAL = 3,
+}
 
 /**
- * Status of a queued event
- */
-export type EventStatus = "pending" | "processing" | "completed" | "failed";
-
-/**
- * Options for queueing an event
+ * Options for queuing an event
  */
 export interface QueueOptions {
-  /**
-   * Priority of the event (affects processing order)
-   */
-  priority?: EventPriority;
-  
-  /**
-   * Delay in milliseconds before the event is eligible for processing
-   */
+  /** Priority level of the event */
+  priority?: QueuePriority;
+  /** Delay in milliseconds before the event should be processed */
   delay?: number;
-  
-  /**
-   * Maximum number of processing attempts
-   */
-  maxAttempts?: number;
+  /** Maximum number of retry attempts if processing fails */
+  maxRetries?: number;
+  /** Custom ID for the queued event (generated automatically if not provided) */
+  id?: string;
 }
 
 /**
- * Representation of a queued event
+ * Configuration for the queue processor
  */
-export interface QueuedEvent<T = unknown> {
-  /**
-   * Unique identifier for the queued event
-   */
+export interface QueueProcessorOptions {
+  /** Maximum number of events to process concurrently */
+  concurrency?: number;
+  /** Interval in milliseconds between processing batches */
+  processInterval?: number;
+  /** Whether to automatically retry failed events */
+  autoRetry?: boolean;
+}
+
+/**
+ * Represents a queued event in the system
+ */
+export interface QueuedEvent<T> {
+  /** Unique identifier for the queued event */
   id: string;
-  
-  /**
-   * The actual message to be processed
-   */
-  message: Message<T> & { topic: string };
-  
-  /**
-   * Current status of the event
-   */
-  status: EventStatus;
-  
-  /**
-   * Priority level
-   */
-  priority: EventPriority;
-  
-  /**
-   * Timestamp when the event was added to the queue
-   */
-  queuedAt: number;
-  
-  /**
-   * Timestamp when the event is scheduled to be processed
-   * (accounts for any delay)
-   */
-  scheduledFor: number;
-  
-  /**
-   * Number of processing attempts
-   */
-  attempts: number;
-  
-  /**
-   * Maximum number of attempts before giving up
-   */
-  maxAttempts: number;
+  /** The topic this event belongs to */
+  topic: string;
+  /** The actual message containing the payload */
+  message: Message<T>;
+  /** Priority level of the event */
+  priority: QueuePriority;
+  /** Timestamp when the event should be processed */
+  scheduledTime: number;
+  /** Number of retry attempts made */
+  retryCount: number;
+  /** Maximum number of retry attempts */
+  maxRetries: number;
 }
 
 /**
- * Node in the event queue linked list
- */
-export interface QueueEventNode<T = unknown> {
-  event: QueuedEvent<T>;
-  next: QueueEventNode<T> | null;
-}
-
-/**
- * Queue status information
+ * Queue status information for monitoring
  */
 export interface QueueStatus {
-  /**
-   * Total number of events in the queue
-   */
+  /** Total number of events in the queue */
   size: number;
-  
-  /**
-   * Number of events currently being processed
-   */
-  processing: number;
-  
-  /**
-   * Number of events successfully completed
-   */
-  completed: number;
-  
-  /**
-   * Number of events that failed processing
-   */
-  failed: number;
+  /** Number of high-priority events */
+  highPriorityCount: number;
+  /** Whether the queue processor is currently running */
+  isProcessing: boolean;
+  /** Queue processor statistics */
+  stats: {
+    /** Total events processed since queue creation */
+    totalProcessed: number;
+    /** Total failed events */
+    totalFailed: number;
+    /** Average processing time in ms */
+    averageProcessingTime: number;
+  };
 }
 
 /**
- * Options for the queue processor
+ * Node in the linked list representing a queued event
  */
-export interface ProcessorOptions {
-  /**
-   * Number of events to process concurrently
-   */
-  concurrency?: number;
+export interface QueueNode<T> {
+  /** The queued event data */
+  data: QueuedEvent<T>;
+  /** Reference to the next node in the list */
+  next: QueueNode<T> | null;
+}
+
+/**
+ * Interface for the event queue
+ */
+export interface IEventQueue<TMap extends TopicMap> {
+  /** Enqueue a new event */
+  enqueue<Topic extends AvailableTopic<TMap>>(
+    topic: Topic,
+    payload: TMap[Topic],
+    options?: QueueOptions
+  ): QueuedEvent<TMap[Topic]>;
   
-  /**
-   * Milliseconds between processing cycles
-   */
-  processInterval?: number;
+  /** Dequeue the next event based on priority and scheduled time */
+  dequeue(): QueuedEvent<unknown> | null;
   
-  /**
-   * Whether to automatically retry failed events
-   */
-  autoRetry?: boolean;
+  /** Peek at the next event without removing it */
+  peek(): QueuedEvent<unknown> | null;
   
-  /**
-   * Milliseconds to wait before retrying a failed event
-   */
-  retryDelay?: number;
+  /** Get the current queue status */
+  getStatus(): QueueStatus;
 }

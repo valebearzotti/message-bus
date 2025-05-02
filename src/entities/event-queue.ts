@@ -1,83 +1,107 @@
 import { Message } from "../models/message";
-import { QueueOptions, QueuedEvent, QueueEventNode, QueueStatus } from "../models/queue";
+import { 
+  IEventQueue, 
+  QueueNode, 
+  QueueOptions, 
+  QueuePriority, 
+  QueueStatus, 
+  QueuedEvent 
+} from "../models/queue";
+import { AvailableTopic, TopicMap } from "../models/topic";
 import { generateId } from "../utils/id";
 
 /**
- * Implementation of a queue for events using a linked list structure.
- * Allows for prioritization and sequential processing of events.
+ * Create a new queue node
  */
-export class EventQueue<T = unknown> {
-  private head: QueueEventNode<T> | null = null;
-  private tail: QueueEventNode<T> | null = null;
+function createQueueNode<T>(data: QueuedEvent<T>): QueueNode<T> {
+  return {
+    data,
+    next: null
+  };
+}
+
+/**
+ * Implementation of a priority queue for events using a linked list
+ */
+export class EventQueue<TMap extends TopicMap> implements IEventQueue<TMap> {
+  private head: QueueNode<unknown> | null = null;
   private size: number = 0;
-  private processingCount: number = 0;
-  private completedCount: number = 0;
-  private failedCount: number = 0;
+  private highPriorityCount: number = 0;
+  private isProcessing: boolean = false;
+  private stats = {
+    totalProcessed: 0,
+    totalFailed: 0,
+    processingTimes: [] as number[],
+  };
 
   /**
    * Add a new event to the queue
    */
-  enqueue(message: Message<T>, options: QueueOptions = {}): QueuedEvent<T> {
-    const queuedAt = Date.now();
-    const priority = options.priority || "normal";
+  enqueue<Topic extends AvailableTopic<TMap>>(
+    topic: Topic,
+    payload: TMap[Topic],
+    options: QueueOptions = {}
+  ): QueuedEvent<TMap[Topic]> {
+    const message: Message<TMap[Topic]> = {
+      id: options.id ? `msg-${options.id}` : `msg-${generateId(topic)}`,
+      payload,
+      timestamp: Date.now(),
+    };
+
     const delay = options.delay || 0;
-    const scheduledFor = queuedAt + delay;
-    
-    const queuedEvent: QueuedEvent<T> = {
-      id: generateId(),
+    const priority = options.priority !== undefined ? options.priority : QueuePriority.NORMAL;
+    const maxRetries = options.maxRetries !== undefined ? options.maxRetries : 3;
+
+    const queuedEvent: QueuedEvent<TMap[Topic]> = {
+      id: options.id || generateId(topic),
+      topic,
       message,
-      status: "pending",
       priority,
-      queuedAt,
-      scheduledFor,
-      attempts: 0,
-      maxAttempts: options.maxAttempts || 3,
+      scheduledTime: Date.now() + delay,
+      retryCount: 0,
+      maxRetries,
     };
 
-    const newNode: QueueEventNode<T> = {
-      event: queuedEvent,
-      next: null,
-    };
+    // Create a new node for the linked list
+    const newNode = createQueueNode(queuedEvent as unknown as QueuedEvent<unknown>);
 
-    // If queue is empty
+    // Update high priority count if needed
+    if (priority >= QueuePriority.HIGH) {
+      this.highPriorityCount++;
+    }
+
+    // If queue is empty, set as head
     if (!this.head) {
       this.head = newNode;
-      this.tail = newNode;
       this.size++;
       return queuedEvent;
     }
 
-    // Priority based insertion
-    if (priority === "high") {
-      // If the new node has higher priority than head
-      if (this.head.event.priority !== "high") {
-        newNode.next = this.head;
-        this.head = newNode;
-        this.size++;
-        return queuedEvent;
-      }
+    // Handle insertion based on priority and scheduled time
+    let current = this.head;
+    let previous: QueueNode<unknown> | null = null;
 
-      // Find the last high priority node
-      let current = this.head;
-      while (current.next && current.next.event.priority === "high") {
-        current = current.next;
-      }
-      
-      newNode.next = current.next;
-      current.next = newNode;
-      
-      // If we're at the end of the list
-      if (!newNode.next) {
-        this.tail = newNode;
-      }
-    } else {
-      // Normal or low priority, add to end
-      if (this.tail) {
-        this.tail.next = newNode;
-        this.tail = newNode;
-      }
+    // Find the correct position to insert
+    while (
+      current && 
+      (current.data.priority > newNode.data.priority || 
+       (current.data.priority === newNode.data.priority && 
+        current.data.scheduledTime <= newNode.data.scheduledTime))
+    ) {
+      previous = current;
+      current = current.next;
     }
-    
+
+    // Insert at the beginning
+    if (!previous) {
+      newNode.next = this.head;
+      this.head = newNode;
+    } else {
+      // Insert in the middle or at the end
+      previous.next = newNode;
+      newNode.next = current;
+    }
+
     this.size++;
     return queuedEvent;
   }
@@ -85,144 +109,91 @@ export class EventQueue<T = unknown> {
   /**
    * Remove and return the next event from the queue
    */
-  dequeue(): QueuedEvent<T> | null {
-    if (!this.head) return null;
-
-    const dequeuedEvent = this.head.event;
-    this.head = this.head.next;
-    
+  dequeue(): QueuedEvent<unknown> | null {
     if (!this.head) {
-      this.tail = null;
+      return null;
     }
-    
-    this.size--;
-    return dequeuedEvent;
-  }
 
-  /**
-   * Look at the next event without removing it
-   */
-  peek(): QueuedEvent<T> | null {
-    return this.head ? this.head.event : null;
-  }
-
-  /**
-   * Get all events that are ready to be processed
-   */
-  getReadyEvents(): QueuedEvent<T>[] {
-    const readyEvents: QueuedEvent<T>[] = [];
     const now = Date.now();
-    
-    let current = this.head;
-    while (current) {
-      if (current.event.status === "pending" && current.event.scheduledFor <= now) {
-        readyEvents.push(current.event);
-      }
-      current = current.next;
+    // Skip events that are scheduled for the future
+    if (this.head.data.scheduledTime > now) {
+      return null;
     }
-    
-    return readyEvents;
+
+    const event = this.head.data;
+    this.head = this.head.next;
+    this.size--;
+
+    if (event.priority >= QueuePriority.HIGH) {
+      this.highPriorityCount--;
+    }
+
+    return event;
   }
 
   /**
-   * Update the status of an event
+   * View the next event without removing it
    */
-  updateEventStatus(eventId: string, status: QueuedEvent<T>["status"]): boolean {
-    let current = this.head;
-    
-    while (current) {
-      if (current.event.id === eventId) {
-        current.event.status = status;
-        
-        if (status === "processing") {
-          this.processingCount++;
-        } else if (status === "completed") {
-          this.processingCount--;
-          this.completedCount++;
-        } else if (status === "failed") {
-          this.processingCount--;
-          this.failedCount++;
-        }
-        
-        return true;
-      }
-      current = current.next;
-    }
-    
-    return false;
+  peek(): QueuedEvent<unknown> | null {
+    return this.head?.data || null;
   }
 
   /**
-   * Increment attempt count for an event
-   */
-  incrementAttempt(eventId: string): boolean {
-    let current = this.head;
-    
-    while (current) {
-      if (current.event.id === eventId) {
-        current.event.attempts++;
-        return true;
-      }
-      current = current.next;
-    }
-    
-    return false;
-  }
-
-  /**
-   * Remove an event from the queue by ID
-   */
-  removeEvent(eventId: string): boolean {
-    if (!this.head) return false;
-    
-    // If head is the target
-    if (this.head.event.id === eventId) {
-      this.head = this.head.next;
-      if (!this.head) {
-        this.tail = null;
-      }
-      this.size--;
-      return true;
-    }
-    
-    // Search the list
-    let current = this.head;
-    while (current.next) {
-      if (current.next.event.id === eventId) {
-        // If we're removing the tail
-        if (current.next === this.tail) {
-          this.tail = current;
-        }
-        
-        current.next = current.next.next;
-        this.size--;
-        return true;
-      }
-      current = current.next;
-    }
-    
-    return false;
-  }
-
-  /**
-   * Get current queue status
+   * Get the current status of the queue
    */
   getStatus(): QueueStatus {
     return {
       size: this.size,
-      processing: this.processingCount,
-      completed: this.completedCount,
-      failed: this.failedCount
+      highPriorityCount: this.highPriorityCount,
+      isProcessing: this.isProcessing,
+      stats: {
+        totalProcessed: this.stats.totalProcessed,
+        totalFailed: this.stats.totalFailed,
+        averageProcessingTime: this.calculateAverageProcessingTime(),
+      },
     };
   }
 
   /**
-   * Clear the queue
+   * Mark the queue as currently processing
    */
-  clear(): void {
-    this.head = null;
-    this.tail = null;
-    this.size = 0;
-    this.processingCount = 0;
+  setProcessing(isProcessing: boolean): void {
+    this.isProcessing = isProcessing;
+  }
+
+  /**
+   * Record statistics for a processed event
+   */
+  recordProcessed(processingTime: number, failed: boolean = false): void {
+    this.stats.totalProcessed++;
+    this.stats.processingTimes.push(processingTime);
+    
+    // Keep only the last 100 processing times for average calculation
+    if (this.stats.processingTimes.length > 100) {
+      this.stats.processingTimes.shift();
+    }
+    
+    if (failed) {
+      this.stats.totalFailed++;
+    }
+  }
+
+  /**
+   * Calculate the average processing time
+   */
+  private calculateAverageProcessingTime(): number {
+    if (this.stats.processingTimes.length === 0) {
+      return 0;
+    }
+    
+    const sum = this.stats.processingTimes.reduce((a, b) => a + b, 0);
+    return Math.round(sum / this.stats.processingTimes.length);
+  }
+  
+  /**
+   * Check if the queue has any events ready to process
+   */
+  hasReadyEvents(): boolean {
+    return this.head !== null && this.head.data.scheduledTime <= Date.now();
   }
 }
